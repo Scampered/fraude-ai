@@ -31,3 +31,4 @@ pnpm-debug.log*
 
 # packaged release copy
 fraude-release-unpacked/
+"fraudecode_config.json" 
