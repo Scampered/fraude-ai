@@ -1,0 +1,33 @@
+# dependencies
+node_modules/
+dist/
+
+# local data and secrets
+fraude-memory/
+fraude-code-memory/
+style_profiles/
+.env
+.env.local
+.env.*.local
+*.local
+*.secret
+*.key
+*.pem
+**/._*
+
+# logs and caches
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+.cache/
+
+# editor and OS files
+.vscode/
+.DS_Store
+*.swp
+*.bak
+
+# packaged release copy
+fraude-release-unpacked/

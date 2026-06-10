@@ -1,0 +1,316 @@
+@import url('https://fonts.googleapis.com/css2?family=Styrene+A:wght@400;500;600&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #root { height: 100%; overflow: hidden; }
+
+/* ── Theme variables ── */
+:root {
+  --bg:           #FAF9F5;
+  --bg2:          #F0EFE9;
+  --bg3:          #E8E6DF;
+  --bg-hover:     #ECEAE3;
+  --bg-active:    #E2E0D8;
+  --border:       #D5D2C8;
+  --border-sub:   #E0DDD5;
+  --text:         #1F1E1D;
+  --text2:        #6B6860;
+  --text3:        #B0AEA5;
+  --accent:       #C15F3C;
+  --accent-dim:   #F5EDE8;
+  --accent-hover: #A84E2E;
+  --success:      #2D7A47;
+  --danger:       #C13C3C;
+  --code-bg:      #F4F2EC;
+  --code-border:  #DDD9CE;
+  --msg-user-bg:  #ECEAE3;
+  --sidebar-bg:   #F0EFE9;
+  --input-bg:     #FFFFFF;
+  --radius:       8px;
+  --font-ui:      'Styrene A', -apple-system, 'Segoe UI', sans-serif;
+  --font-serif:   'Georgia', 'Times New Roman', serif;
+  --font-mono:    'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+}
+
+body.dark {
+  --bg:           #141413;
+  --bg2:          #1A1918;
+  --bg3:          #222120;
+  --bg-hover:     #252422;
+  --bg-active:    #2C2B29;
+  --border:       #333230;
+  --border-sub:   #2A2927;
+  --text:         #F0EEE8;
+  --text2:        #9A9891;
+  --text3:        #585550;
+  --accent:       #C15F3C;
+  --accent-dim:   #2A1A12;
+  --accent-hover: #D4714D;
+  --success:      #3FB950;
+  --danger:       #F85149;
+  --code-bg:      #0F0E0D;
+  --code-border:  #2A2927;
+  --msg-user-bg:  #222120;
+  --sidebar-bg:   #141413;
+  --input-bg:     #1A1918;
+}
+
+body { background: var(--bg); color: var(--text); font-family: var(--font-ui); font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+
+/* ── Scrollbars ── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+* { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+/* ── Inputs ── */
+textarea, input { font-family: var(--font-ui); font-size: inherit; color: var(--text); }
+button { cursor: pointer; font-family: var(--font-ui); font-size: inherit; border: none; background: none; }
+a { color: var(--accent); text-decoration: none; }
+
+/* ── Animations ── */
+@keyframes fadeUp   { from { opacity:0; transform:translateY(6px)  } to { opacity:1; transform:translateY(0) } }
+@keyframes fadeIn   { from { opacity:0 } to { opacity:1 } }
+@keyframes slideInR { from { opacity:0; transform:translateX(10px) } to { opacity:1; transform:translateX(0) } }
+@keyframes spin     { to { transform: rotate(360deg) } }
+@keyframes bannerIn { from { opacity:0; transform:translateY(-8px) translateX(-50%) } to { opacity:1; transform:translateY(0) translateX(-50%) } }
+
+.anim-fadeup   { animation: fadeUp   .22s ease; }
+.anim-fadein   { animation: fadeIn   .18s ease; }
+.anim-slideinr { animation: slideInR .22s ease; }
+.spin { display:inline-block; animation: spin 1s linear infinite; }
+
+/* ── Assistant message text gets serif ── */
+.msg-assistant-body { font-family: var(--font-serif); font-size: 15px; line-height: 1.8; color: var(--text); }
+.msg-assistant-body strong { font-weight: 700; }
+.msg-assistant-body em { font-style: italic; }
+
+/* ── Mobile responsive ───────────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  :root { --sidebar-w: 100vw; }
+
+  .app-layout { flex-direction: column !important; }
+
+  .sidebar {
+    width: 100% !important;
+    height: 56px !important;
+    flex-direction: row !important;
+    border-right: none !important;
+    border-bottom: 1px solid var(--border-sub) !important;
+    padding: 0 12px !important;
+    overflow: hidden !important;
+    flex-shrink: 0 !important;
+  }
+  .sidebar-logo { padding: 0 8px 0 0 !important; border-bottom: none !important; }
+  .sidebar-nav  { flex-direction: row !important; padding: 0 !important; gap: 2px !important; flex: 1 !important; overflow-x: auto !important; }
+  .sidebar-nav button { padding: 8px 10px !important; font-size: 12px !important; white-space: nowrap !important; }
+  .sidebar-nav button span:last-child { display: none !important; }
+  .sidebar-convlist { display: none !important; }
+  .sidebar-account { display: none !important; }
+  .sidebar-mobile-menu { display: flex !important; }
+
+  .mobile-drawer {
+    position: fixed !important;
+    top: 56px !important;
+    left: 0 !important;
+    width: 85vw !important;
+    max-width: 320px !important;
+    height: calc(100vh - 56px) !important;
+    background: var(--bg2) !important;
+    border-right: 1px solid var(--border) !important;
+    z-index: 150 !important;
+    display: flex !important;
+    flex-direction: column !important;
+    overflow-y: auto !important;
+    animation: slideInLeft .2s ease !important;
+  }
+  .mobile-drawer-overlay {
+    position: fixed !important;
+    inset: 0 !important;
+    top: 56px !important;
+    background: rgba(0,0,0,.4) !important;
+    z-index: 149 !important;
+  }
+
+  .main-chat { height: calc(100vh - 56px) !important; }
+  .msg-max-width { max-width: 90% !important; }
+  .artifact-panel { width: 100% !important; position: fixed !important; inset: 0 !important; top: 56px !important; z-index: 100 !important; }
+  .input-area { padding: 0 8px 12px !important; }
+  .input-box { border-radius: 10px !important; }
+}
+
+@keyframes slideInLeft { from { transform: translateX(-100%) } to { transform: translateX(0) } }
+
+/* ── Markdown heading fixes ──────────────────────────────────────────────────── */
+.msg-assistant-body h4 { font-family: var(--font-ui); font-size: 13px; font-weight: 600; color: var(--text); margin: 10px 0 3px; }
+.msg-assistant-body h3 { font-family: var(--font-ui); font-size: 14px; font-weight: 600; color: var(--text); margin: 12px 0 4px; }
+.msg-assistant-body h2 { font-family: var(--font-ui); font-size: 15px; font-weight: 600; color: var(--text); margin: 14px 0 6px; }
+.msg-assistant-body h1 { font-family: var(--font-ui); font-size: 16px; font-weight: 600; color: var(--text); margin: 16px 0 8px; }
+.msg-assistant-body p  { margin: 6px 0; }
+.msg-assistant-body ul { margin: 4px 0 4px 16px; }
+.msg-assistant-body ol { margin: 4px 0 4px 16px; }
+.msg-assistant-body li { margin: 2px 0; }
+.msg-assistant-body hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+
+/* ── Rate limit toast ────────────────────────────────────────────────────────── */
+.rate-toast {
+  position: fixed;
+  bottom: 100px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 16px;
+  font-size: 13px;
+  color: var(--text2);
+  z-index: 300;
+  white-space: nowrap;
+  box-shadow: 0 4px 16px rgba(0,0,0,.15);
+  animation: fadeUp .2s ease;
+}
+
+/* ── Project colours ─────────────────────────────────────────────────────────── */
+.project-item { border-left: 3px solid var(--accent); padding-left: 8px; }
+
+/* ── Fraude logo font ─────────────────────────────────────────────────────────*/
+.fraude-logo-text {
+  font-family: 'Georgia', 'Palatino Linotype', serif !important;
+  font-size: 18px !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.5px !important;
+}
+
+/* ── Mobile overhaul (Claude-style) ──────────────────────────────────────────*/
+@media (max-width: 768px) {
+  .sidebar { display: none !important; }
+  .mobile-topbar { display: flex !important; }
+  .app-layout { flex-direction: column !important; }
+  .main-chat { height: 100vh !important; }
+  .input-area { padding: 0 10px 20px !important; }
+  .msg-user-bubble { max-width: 88% !important; }
+  .artifact-panel { width: 100vw !important; position: fixed !important; inset: 0 !important; z-index: 100 !important; }
+}
+@media (min-width: 769px) {
+  .mobile-topbar { display: none !important; }
+  .mobile-drawer { display: none !important; }
+  .mobile-drawer-overlay { display: none !important; }
+  .sidebar-mobile-menu { display: none !important; }
+}
+
+/* ── Mobile top bar ──────────────────────────────────────────────────────────*/
+.mobile-topbar {
+  height: 52px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border-sub);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px;
+  flex-shrink: 0;
+  z-index: 50;
+}
+.mobile-drawer {
+  position: fixed;
+  top: 0; left: 0; bottom: 0;
+  width: 82vw; max-width: 300px;
+  background: var(--bg2);
+  border-right: 1px solid var(--border);
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  animation: slideInLeft .22s ease;
+}
+.mobile-drawer-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.35);
+  z-index: 199;
+}
+
+/* ── Suggestion chips ────────────────────────────────────────────────────────*/
+.suggestion-chips {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: 560px;
+}
+.chip-category {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  padding: 14px 18px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all .15s;
+  min-width: 100px;
+  text-align: center;
+}
+.chip-category:hover {
+  border-color: var(--accent);
+  background: var(--bg-hover);
+}
+.chip-category .chip-icon { font-size: 20px; }
+.chip-category .chip-label { font-size: 13px; color: var(--text2); font-weight: 500; }
+
+/* ── Quiz modal ──────────────────────────────────────────────────────────────*/
+.quiz-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.4);
+  z-index: 250;
+  display: flex; align-items: center; justify-content: center;
+  padding: 16px;
+}
+.quiz-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  width: min(540px, 95vw);
+  max-height: 80vh;
+  overflow-y: auto;
+  box-shadow: 0 8px 40px rgba(0,0,0,.2);
+  animation: fadeUp .2s ease;
+}
+.quiz-option {
+  display: flex; align-items: center; gap: 14px;
+  padding: 13px 18px;
+  border: 1px solid var(--border-sub);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all .12s;
+  margin-bottom: 8px;
+  background: var(--bg2);
+}
+.quiz-option:hover, .quiz-option.selected {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+.quiz-num {
+  width: 28px; height: 28px;
+  border-radius: 50%;
+  background: var(--bg3);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 600; color: var(--text2);
+  flex-shrink: 0;
+}
+.quiz-option.selected .quiz-num {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* ── FraudeCode ──────────────────────────────────────────────────────────────*/
+.fraude-code-layout {
+  display: flex; height: 100vh; overflow: hidden;
+  background: #0d1117; color: #e6edf3;
+  font-family: var(--font-mono);
+}
+.code-sidebar {
+  width: 220px; background: #161b22; border-right: 1px solid #30363d;
+  display: flex; flex-direction: column; flex-shrink: 0;
+}
+.code-editor-area { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.code-terminal { height: 200px; background: #010409; border-top: 1px solid #30363d; overflow-y: auto; }
+.code-chat { width: 320px; border-left: 1px solid #30363d; display: flex; flex-direction: column; }
