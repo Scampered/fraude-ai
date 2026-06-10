@@ -1,0 +1,10 @@
+{
+  "groqKey": "",
+  "geminiKey": "",
+  "ollamaUrl": "http://localhost:11434",
+  "ollamaModel": "llama3.2",
+  "groqModel": "llama-3.3-70b-versatile",
+  "geminiModel": "gemini-2.0-flash-lite",
+  "fraudeWebUrl": "https://fraude-ai.vercel.app",
+  "fraudeApiUrl": "https://fraude-backend.onrender.com"
+}
