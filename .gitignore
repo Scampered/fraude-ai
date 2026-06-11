@@ -32,3 +32,5 @@ pnpm-debug.log*
 # packaged release copy
 fraude-release-unpacked/
 "fraudecode_config.json" 
+fraudecode_config.json 
+fraudecode_pkg/__pycache__/ 
