@@ -1,0 +1,19 @@
+# Fraude App — runtime dependencies for fraude_tray.py + fraude_automations.py
+# Install: pip install -r requirements.txt
+
+pystray>=0.19.5         # system tray icon (Windows/Mac/Linux)
+Pillow>=10.0.0           # icon drawing
+pyautogui>=0.9.54        # mouse/keyboard automation
+pyperclip>=1.8.2         # clipboard read/write
+psutil>=5.9.0            # system info (CPU/RAM/disk)
+pynput>=1.7.6            # global key recording for the hotkey UI
+requests>=2.31.0         # HTTP calls between local services
+
+# Windows-only (installed automatically via platform markers, harmless elsewhere)
+pycaw>=20230407; sys_platform == 'win32'        # volume control
+comtypes>=1.2.0; sys_platform == 'win32'        # required by pycaw
+win10toast>=0.9; sys_platform == 'win32'        # native toast notifications
+send2trash>=1.8.2                                # cross-platform recycle bin delete
+
+# Optional — only needed if you use the TTS sound action
+edge-tts>=6.1.0

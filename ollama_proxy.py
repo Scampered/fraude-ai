@@ -1,360 +1,481 @@
 #!/usr/bin/env python3
 """
-Fraude Proxy — port 11435
-- Forwards /api/* to Ollama (CORS)
-- WebSocket /ws/fraudecode — real-time bridge between web UI and fraudecode.py
-- /launch-fraudecode, /setup-fraudecode, /health
-- /fraudecode-run  — runs a task via fraudecode pipeline and streams events
+Fraude Ollama Proxy — runs on :11435
+Bridges fraude-ai.vercel.app ↔ local Ollama (:11434) and FraudeCode tools.
 """
-import json, os, sys, subprocess, threading, time, webbrowser, queue
-import urllib.request, urllib.error
+import json, os, sys, threading, subprocess, time, urllib.request, urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+import argparse
 
 PROXY_PORT  = 11435
 OLLAMA_PORT = 11434
-FRAUDE_URL  = 'https://fraude-ai.vercel.app'
-USE_TRAY    = '--tray' in sys.argv
+OLLAMA_URL  = f"http://localhost:{OLLAMA_PORT}"
 
-# ── Event bus for streaming pipeline progress to web ──────────────────────────
-_event_queues: list = []  # list of Queue objects — one per connected web client
-_event_lock = threading.Lock()
+# ── CORS headers ────────────────────────────────────────────────────────────
+CORS = {
+    "Access-Control-Allow-Origin":  "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Private-Network": "true",
+    "X-Content-Type-Options": "nosniff",
+}
 
-def broadcast(event: str, data: dict = None):
-    """Send event to all connected web clients."""
-    msg = json.dumps({'event': event, 'data': data or {}, 'ts': time.time()})
-    with _event_lock:
-        for q in _event_queues[:]:
-            try: q.put_nowait(msg)
-            except Exception: pass
-
-def add_listener():
-    q = queue.Queue(maxsize=200)
-    with _event_lock:
-        _event_queues.append(q)
-    return q
-
-def remove_listener(q):
-    with _event_lock:
-        if q in _event_queues:
-            _event_queues.remove(q)
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-def json_resp(handler, status, data):
-    body = json.dumps(data).encode()
-    handler.send_response(status)
-    handler.send_header('Content-Type', 'application/json')
-    handler.send_header('Access-Control-Allow-Origin', '*')
-    handler.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-    handler.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-    handler.end_headers()
-    handler.wfile.write(body)
+def json_resp(handler, code, data):
+    body = json.dumps(data, ensure_ascii=False).encode()
+    try:
+        handler.send_response(code)
+        for k, v in CORS.items():
+            handler.send_header(k, v)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+    except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+        pass  # Client disconnected — normal browser behaviour
 
 def read_body(handler):
-    n = int(handler.headers.get('Content-Length', 0))
-    raw = handler.rfile.read(n)
-    try: return json.loads(raw or b'{}')
-    except: return {}
+    length = int(handler.headers.get("Content-Length", 0))
+    if length > 0:
+        try:
+            return json.loads(handler.rfile.read(length))
+        except Exception:
+            return {}
+    return {}
 
-def ollama_running():
+# ── SSE event bus ───────────────────────────────────────────────────────────
+_sse_clients = []
+_sse_lock    = threading.Lock()
+
+def sse_push(event: str, data: dict):
+    msg = f"data: {json.dumps({'event': event, 'data': data})}\n\n".encode()
+    with _sse_lock:
+        dead = []
+        for w in _sse_clients:
+            try:
+                w.write(msg)
+                w.flush()
+            except Exception:
+                dead.append(w)
+        for w in dead:
+            _sse_clients.remove(w)
+
+# ── Check Ollama ─────────────────────────────────────────────────────────────
+def ollama_ok():
     try:
-        urllib.request.urlopen(f'http://localhost:{OLLAMA_PORT}/', timeout=2)
+        urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=2)
         return True
-    except: return False
+    except Exception:
+        return False
 
-# ── Handler ────────────────────────────────────────────────────────────────────
+# ── Handler ──────────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
 
-    def _cors(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+    def log_message(self, fmt, *args):
+        pass  # Suppress default access log spam
 
     def do_OPTIONS(self):
-        self.send_response(200); self._cors(); self.end_headers()
+        try:
+            self.send_response(204)
+            for k, v in CORS.items():
+                self.send_header(k, v)
+            # Explicit PNA preflight header — required for Chrome targetAddressSpace:'private'
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionAbortedError):
+            pass
 
     def do_GET(self):
-        if self.path in ('/', '/health', '/fraude-proxy'):
-            return json_resp(self, 200, {
-                'ok': True, 'proxy': 'fraude-ollama',
-                'port': PROXY_PORT, 'ollama_running': ollama_running(),
-            })
-        # SSE stream for pipeline events
-        if self.path == '/events':
-            return self._sse_stream()
-        # Workspace file listing
-        if self.path.startswith('/workspace-files?'):
-            from urllib.parse import parse_qs, urlparse
-            qs = parse_qs(urlparse(self.path).query)
-            d  = qs.get('dir', [''])[0]
-            if d and os.path.exists(d):
-                try:
-                    from fraudecode_pkg import workspace as ws
-                    files = ws.list_files(d)
-                    manifest = ws.get_manifest(d) if ws.has_workspace(d) else {}
-                    log = ws.get_log(d) if ws.has_workspace(d) else []
-                    return json_resp(self, 200, {'files': files, 'manifest': manifest, 'log': log})
-                except ImportError:
-                    pass
-            return json_resp(self, 200, {'files': [], 'manifest': {}, 'log': []})
-        self._forward('GET', b'')
-
-    def do_POST(self):
-        if self.path == '/health':
-            return json_resp(self, 200, {'ok': True, 'proxy': 'fraude-ollama'})
-
-        if self.path == '/launch-fraudecode':
-            body = read_body(self)
-            d    = (body.get('directory') or '').strip()
-            if not d:
-                return json_resp(self, 400, {'error': 'No directory provided.'})
-            fc = os.path.join(d, 'fraudecode.py')
-            if not os.path.exists(fc):
-                return json_resp(self, 404, {'error': f'fraudecode.py not found in: {d}'})
-            try:
-                if sys.platform == 'win32':
-                    subprocess.Popen(f'start cmd /k "cd /d {d} && python fraudecode.py"', shell=True)
-                else:
-                    subprocess.Popen(f'cd "{d}" && python3 fraudecode.py',
-                        shell=True, start_new_session=True)
-                return json_resp(self, 200, {'message': 'FraudeCode launched in new terminal.'})
-            except Exception as e:
-                return json_resp(self, 500, {'error': str(e)})
-
-        if self.path == '/setup-fraudecode':
-            body = read_body(self)
-            d    = (body.get('directory') or '').strip()
-            if not d or not os.path.exists(d):
-                return json_resp(self, 400, {'error': f'Directory not found: {d}'})
-            try:
-                pkgs = ['requests','google-generativeai','groq','colorama','pyreadline3','pystray','pillow']
-                r = subprocess.run(
-                    [sys.executable,'-m','pip','install','--quiet','--upgrade'] + pkgs,
-                    capture_output=True, text=True, timeout=120)
-                if r.returncode == 0:
-                    return json_resp(self, 200, {'message': f'Done! Installed: {", ".join(pkgs)}'})
-                return json_resp(self, 500, {'error': 'pip error: ' + r.stderr[:400]})
-            except Exception as e:
-                return json_resp(self, 500, {'error': str(e)})
-
-        # Run a fraudecode task from web (streams events via /events SSE)
-        if self.path == '/fraudecode-run':
-            body = read_body(self)
-            task   = body.get('task', '').strip()
-            wdir   = body.get('workdir', '').strip()
-            fc_dir = body.get('fc_dir', '').strip()
-            if not task:
-                return json_resp(self, 400, {'error': 'No task provided.'})
-            threading.Thread(
-                target=_run_fraudecode_task,
-                args=(task, wdir, fc_dir),
-                daemon=True
-            ).start()
-            return json_resp(self, 200, {'message': 'Task started — listen to /events for progress.'})
-
-        # Orchestrate from web
-        if self.path == '/orchestrate':
-            body    = read_body(self)
-            request = body.get('request', '').strip()
-            wdir    = body.get('workdir', '').strip()
-            fc_dir  = body.get('fc_dir', '').strip()
-            if not request or not wdir:
-                return json_resp(self, 400, {'error': 'request and workdir required'})
-            threading.Thread(
-                target=_run_orchestrator,
-                args=(request, wdir, fc_dir),
-                daemon=True
-            ).start()
-            return json_resp(self, 200, {'message': 'Orchestrator started — listen to /events.'})
-
-        # Audit from web
-        if self.path == '/audit':
-            body = read_body(self)
-            wdir = body.get('workdir', '').strip()
-            fc_dir = body.get('fc_dir', '').strip()
-            if not wdir:
-                return json_resp(self, 400, {'error': 'workdir required'})
-            threading.Thread(target=_run_audit, args=(wdir, fc_dir), daemon=True).start()
-            return json_resp(self, 200, {'message': 'Audit started — listen to /events.'})
-
-        # Default: forward to Ollama
-        n    = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(n)
-        self._forward('POST', body)
+        if self.path.startswith("/events"):
+            self._sse_stream()
+            return
+        if self.path.startswith("/health"):
+            json_resp(self, 200, {"proxy": "fraude-ollama", "ollama": ollama_ok(), "port": PROXY_PORT})
+            return
+        if self.path.startswith("/workspace-files"):
+            self._workspace_files()
+            return
+        json_resp(self, 404, {"error": "Not found"})
 
     def _sse_stream(self):
-        """Server-Sent Events endpoint — streams pipeline events to web UI."""
-        q = add_listener()
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/event-stream')
-        self.send_header('Cache-Control', 'no-cache')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Connection', 'keep-alive')
-        self.end_headers()
         try:
+            self.send_response(200)
+            for k, v in CORS.items():
+                self.send_header(k, v)
+            self.send_header("Content-Type",  "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection",    "keep-alive")
+            self.end_headers()
+            with _sse_lock:
+                _sse_clients.append(self.wfile)
+            # Keep connection open
             while True:
                 try:
-                    msg = q.get(timeout=25)
-                    self.wfile.write(f'data: {msg}\n\n'.encode())
+                    self.wfile.write(b": ping\n\n")
                     self.wfile.flush()
-                except queue.Empty:
-                    # Send keepalive
-                    self.wfile.write(b': keepalive\n\n')
-                    self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+                    time.sleep(15)
+                except Exception:
+                    break
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             pass
         finally:
-            remove_listener(q)
+            with _sse_lock:
+                if self.wfile in _sse_clients:
+                    _sse_clients.remove(self.wfile)
 
-    def _forward(self, method, body):
-        target = f'http://localhost:{OLLAMA_PORT}{self.path}'
+    def _workspace_files(self):
+        from urllib.parse import urlparse, parse_qs
+        qs  = parse_qs(urlparse(self.path).query)
+        d   = qs.get("dir", [""])[0]
+        if not d or not os.path.isdir(d):
+            json_resp(self, 200, {"files": [], "manifest": {}})
+            return
+        SKIP = {".venv", "__pycache__", "node_modules", ".git"}
+        files = []
+        for root, dirs, fs in os.walk(d):
+            dirs[:] = [x for x in dirs if x not in SKIP and not x.startswith(".")]
+            for f in fs:
+                if not f.startswith("."):
+                    files.append(os.path.relpath(os.path.join(root, f), d))
+        json_resp(self, 200, {"files": files, "manifest": {}})
+
+    def do_POST(self):
+        body = read_body(self)
+        p    = self.path.split("?")[0]
+
+        # ── Ollama API pass-through ──────────────────────────────────────
+        if p in ("/api/chat", "/api/generate", "/api/tags", "/api/pull"):
+            self._forward_ollama(p, body)
+            return
+
+        # ── Health / proxy status ─────────────────────────────────────────
+        if p == "/health":
+            json_resp(self, 200, {"proxy": "fraude-ollama", "ollama": ollama_ok()})
+            return
+
+        # ── Launch Fraude App (automations server) ─────────────────────────────
+        if p == "/launch-fraude-app":
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fraude_automations.py")
+            if not os.path.exists(script):
+                json_resp(self, 400, {"error": "fraude_automations.py not found in fraude-ai folder"})
+                return
+            try:
+                python = sys.executable
+                subprocess.Popen(
+                    [python, script],
+                    cwd=os.path.dirname(script),
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                json_resp(self, 200, {"message": "Fraude Automations started."})
+            except Exception as e:
+                json_resp(self, 500, {"error": str(e)})
+            return
+        if p == "/launch-jarvis":
+            directory = body.get("directory", "").strip()
+            # Default to same directory as proxy script if not specified
+            if not directory or not os.path.isdir(directory):
+                directory = os.path.dirname(os.path.abspath(__file__))
+            script = os.path.join(directory, "jarvis.py")
+            if not os.path.exists(script):
+                # Try common locations
+                for try_dir in [os.path.dirname(os.path.abspath(__file__)), os.path.expanduser("~")]:
+                    candidate = os.path.join(try_dir, "jarvis.py")
+                    if os.path.exists(candidate):
+                        script = candidate; directory = try_dir; break
+                else:
+                    json_resp(self, 400, {"error": "jarvis.py not found. Set the JARVIS folder in Automations."})
+                    return
+            try:
+                python = sys.executable
+                subprocess.Popen(
+                    [python, script],
+                    cwd=directory,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                json_resp(self, 200, {"message": "JARVIS started in background."})
+            except Exception as e:
+                json_resp(self, 500, {"error": str(e)})
+            return
+        if p == "/launch-fraudecode":
+            directory = body.get("directory", "").strip()
+            if not directory or not os.path.isdir(directory):
+                json_resp(self, 400, {"error": f"Directory not found: {directory}"})
+                return
+            script = os.path.join(directory, "fraudecode.py")
+            if not os.path.exists(script):
+                json_resp(self, 400, {"error": f"fraudecode.py not found in {directory}"})
+                return
+            try:
+                python = sys.executable
+                # Hidden: CREATE_NO_WINDOW — no console appears at all
+                subprocess.Popen(
+                    [python, script],
+                    cwd=directory,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                json_resp(self, 200, {"message": "FraudeCode CLI started in background (hidden)."})
+            except Exception as e:
+                json_resp(self, 500, {"error": str(e)})
+            return
+
+        # ── Show FraudeCode CLI (visible terminal window on demand) ───────────
+        if p == "/show-fraudecode":
+            directory = body.get("directory", "").strip()
+            if not directory or not os.path.isdir(directory):
+                json_resp(self, 400, {"error": f"Directory not found: {directory}"})
+                return
+            script = os.path.join(directory, "fraudecode.py")
+            if not os.path.exists(script):
+                json_resp(self, 400, {"error": f"fraudecode.py not found in {directory}"})
+                return
+            try:
+                python = sys.executable
+                # Visible: CREATE_NEW_CONSOLE — opens a proper terminal window
+                subprocess.Popen(
+                    ["cmd", "/k", python, script],
+                    cwd=directory,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                )
+                json_resp(self, 200, {"message": "FraudeCode CLI terminal opened."})
+            except Exception as e:
+                json_resp(self, 500, {"error": str(e)})
+            return
+
+        # ── Setup FraudeCode deps ──────────────────────────────────────────
+        if p == "/setup-fraudecode":
+            directory = body.get("directory", "").strip()
+            if not directory:
+                json_resp(self, 400, {"error": "No directory provided"})
+                return
+            req = os.path.join(directory, "requirements.txt")
+            try:
+                python = sys.executable
+                if os.path.exists(req):
+                    subprocess.run([python, "-m", "pip", "install", "-r", req, "-q"], timeout=120)
+                else:
+                    subprocess.run([python, "-m", "pip", "install",
+                                    "requests", "colorama", "pyreadline3", "-q"], timeout=120)
+                json_resp(self, 200, {"message": "Dependencies installed."})
+            except Exception as e:
+                json_resp(self, 500, {"error": str(e)})
+            return
+
+        # ── Run FraudeCode task ────────────────────────────────────────────
+        if p == "/fraudecode-run":
+            task    = body.get("task", "")
+            workdir = body.get("workdir", "") or ""
+            fc_dir  = body.get("fc_dir",  "") or ""
+            if not fc_dir or not os.path.isdir(fc_dir):
+                json_resp(self, 400, {"error": "FraudeCode folder not set. Go to Setup in FraudeCode."})
+                return
+            threading.Thread(target=self._run_task, args=(task, workdir, fc_dir), daemon=True).start()
+            json_resp(self, 200, {"queued": True})
+            return
+
+        # ── Orchestrate ────────────────────────────────────────────────────
+        if p == "/orchestrate":
+            request = body.get("request", "")
+            workdir = body.get("workdir", "") or ""
+            fc_dir  = body.get("fc_dir",  "") or ""
+            if not fc_dir or not os.path.isdir(fc_dir):
+                json_resp(self, 400, {"error": "FraudeCode folder not set."})
+                return
+            threading.Thread(target=self._orchestrate, args=(request, workdir, fc_dir), daemon=True).start()
+            json_resp(self, 200, {"queued": True})
+            return
+
+        # ── Audit ──────────────────────────────────────────────────────────
+        if p == "/audit":
+            workdir = body.get("workdir", "") or ""
+            fc_dir  = body.get("fc_dir",  "") or ""
+            threading.Thread(target=self._audit, args=(workdir, fc_dir), daemon=True).start()
+            json_resp(self, 200, {"queued": True})
+            return
+
+        # ── Package workspace ──────────────────────────────────────────────
+        if p == "/package-workspace":
+            self._package(body)
+            return
+
+        json_resp(self, 404, {"error": f"Unknown route: {p}"})
+
+    def _forward_ollama(self, path, body):
+        """Pass request directly to local Ollama."""
         try:
-            req = urllib.request.Request(
-                target, data=body or None,
-                headers={'Content-Type': 'application/json'},
-                method=method)
+            data = json.dumps(body).encode()
+            req  = urllib.request.Request(
+                OLLAMA_URL + path, data=data,
+                headers={"Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=120) as r:
-                result = r.read()
-                ct = r.headers.get('Content-Type', 'application/json')
-            self.send_response(200)
-            self.send_header('Content-Type', ct)
-            self._cors()
-            self.end_headers()
-            self.wfile.write(result)
-        except urllib.error.URLError as e:
-            json_resp(self, 503, {'error': f'Ollama not reachable: {e.reason}'})
+                resp_body = r.read()
+            try:
+                self.send_response(200)
+                for k, v in CORS.items():
+                    self.send_header(k, v)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp_body)))
+                self.end_headers()
+                self.wfile.write(resp_body)
+            except (BrokenPipeError, ConnectionAbortedError):
+                pass
         except Exception as e:
-            json_resp(self, 500, {'error': str(e)})
+            json_resp(self, 502, {"error": f"Ollama: {e}"})
 
-    def log_message(self, *a): pass
-
-# ── Background task runners ────────────────────────────────────────────────────
-def _setup_fraudecode_path(fc_dir: str):
-    """Add fraudecode directory to Python path so we can import fraudecode_pkg."""
-    if fc_dir and fc_dir not in sys.path:
-        sys.path.insert(0, fc_dir)
-
-def _run_fraudecode_task(task: str, workdir: str, fc_dir: str):
-    """Run a single-agent fraudecode task and stream events."""
-    _setup_fraudecode_path(fc_dir)
-    broadcast('task_start', {'task': task[:100]})
-    try:
-        from fraudecode_pkg import agents, config
-        cfg = config.load()
-        agents.set_config(cfg)
-        from fraudecode_pkg import orchestrator
-        orchestrator.set_progress_callback(broadcast)
-        result = agents.run(task, workdir=workdir or None)
-        broadcast('task_done', {
-            'code': result.code[:5000] if result.code else '',
-            'explanation': result.explanation[:2000] if result.explanation else '',
-            'orchestrated': result.orchestrated,
-            'errors': result.errors,
-        })
-    except Exception as e:
-        broadcast('task_error', {'error': str(e)})
-
-def _run_orchestrator(request: str, workdir: str, fc_dir: str):
-    _setup_fraudecode_path(fc_dir)
-    broadcast('orch_start', {'request': request[:100]})
-    try:
-        from fraudecode_pkg import agents, config, orchestrator
-        cfg = config.load()
-        agents.set_config(cfg)
-        orchestrator.set_progress_callback(broadcast)
-        result = orchestrator.run(request, workdir)
-        broadcast('orch_complete', {
-            'files': result.files_written,
-            'review': result.review,
-            'success': result.success,
-        })
-    except Exception as e:
-        broadcast('orch_error', {'error': str(e)})
-
-def _run_audit(workdir: str, fc_dir: str):
-    _setup_fraudecode_path(fc_dir)
-    broadcast('audit_start', {})
-    try:
-        from fraudecode_pkg import agents, config, orchestrator
-        cfg = config.load()
-        agents.set_config(cfg)
-        orchestrator.set_progress_callback(broadcast)
-        report = orchestrator.run_cybersec_audit(workdir)
-        broadcast('audit_complete', {'report': report})
-    except Exception as e:
-        broadcast('audit_error', {'error': str(e)})
-
-# ── Tray ───────────────────────────────────────────────────────────────────────
-def run_tray(server):
-    try:
-        import pystray
-        from PIL import Image, ImageDraw
-        img = Image.new('RGBA', (64,64),(0,0,0,0))
-        d = ImageDraw.Draw(img)
-        d.ellipse([2,2,62,62], fill=(232,87,42))
-        d.text((20,16),'F',fill='white')
-        menu = pystray.Menu(
-            pystray.MenuItem('Open Fraude', lambda *a: webbrowser.open(
-                f'{FRAUDE_URL}?ollamaProxy=1&ollamaPort={PROXY_PORT}'), default=True),
-            pystray.MenuItem(f'Proxy :11435', lambda *a: None, enabled=False),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem('Quit', lambda icon, *a: (icon.stop(), server.shutdown(), os._exit(0))),
-        )
-        pystray.Icon('fraude', img, 'Fraude — Local AI', menu).run()
-    except Exception:
+    def _run_task(self, task, workdir, fc_dir):
         try:
-            while True: time.sleep(60)
-        except KeyboardInterrupt:
-            server.shutdown()
+            sys.path.insert(0, fc_dir)
+            from fraudecode_pkg.agents import run as run_pipeline, set_config
+            from fraudecode_pkg.config import load
+            cfg = load() or {}
+            set_config(cfg)
+            sse_push("task_start", {"task": task})
+            result = run_pipeline(task, workdir or None)
+            sse_push("task_done", {
+                "code": result.code,
+                "explanation": result.explanation,
+                "task_type": result.task_type,
+                "fallbacks": result.fallbacks,
+            })
+        except Exception as e:
+            sse_push("task_error", {"error": str(e)})
 
-BANNER = """
+    def _orchestrate(self, request, workdir, fc_dir):
+        try:
+            sys.path.insert(0, fc_dir)
+            from fraudecode_pkg import orchestrator
+            from fraudecode_pkg.agents import set_config
+            from fraudecode_pkg.config import load
+            cfg = load() or {}
+            set_config(cfg)
+            sse_push("orch_start", {"request": request})
+            result = orchestrator.run(request, workdir or fc_dir)
+            sse_push("orch_complete", {
+                "orchestrated": True,
+                "files": result.files_written,
+                "summary": getattr(result.review, "get", lambda k, d=None: d)("summary", ""),
+            })
+        except Exception as e:
+            sse_push("orch_error", {"error": str(e)})
+
+    def _audit(self, workdir, fc_dir):
+        try:
+            if not workdir or not os.path.isdir(workdir):
+                sse_push("audit_complete", {"report": "No workspace set."})
+                return
+            sys.path.insert(0, fc_dir or ".")
+            from fraudecode_pkg.agents import run as run_pipeline, set_config
+            from fraudecode_pkg.config import load
+            cfg = load() or {}
+            set_config(cfg)
+            audit_prompt = (
+                f"Security audit of workspace at {workdir}. "
+                "Check for: hardcoded secrets, SQL injection, path traversal, "
+                "insecure dependencies, input validation issues. "
+                "List all issues found with severity (HIGH/MED/LOW)."
+            )
+            result = run_pipeline(audit_prompt, workdir)
+            sse_push("audit_complete", {"report": result.code or result.explanation or "Audit complete."})
+        except Exception as e:
+            sse_push("audit_complete", {"report": f"Audit error: {e}"})
+
+    def _package(self, body):
+        import zipfile, tempfile
+        workdir = (body.get("workdir") or "").strip()
+        if not workdir or not os.path.isdir(workdir):
+            json_resp(self, 400, {"error": f"Workspace not found: {workdir}"})
+            return
+        try:
+            ts       = time.strftime("%Y%m%d_%H%M%S")
+            name     = os.path.basename(workdir.rstrip("/\\")) or "workspace"
+            zip_name = f"{name}_{ts}.zip"
+            tmp_dir  = os.path.join(os.environ.get("TEMP", "/tmp"), "fraude_packages")
+            os.makedirs(tmp_dir, exist_ok=True)
+            zip_path = os.path.join(tmp_dir, zip_name)
+            SKIP = {".venv", "__pycache__", "node_modules", ".git"}
+            count = 0
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for root, dirs, files in os.walk(workdir):
+                    dirs[:] = [d for d in dirs if d not in SKIP and not d.startswith(".")]
+                    for f in files:
+                        if not f.startswith("."):
+                            abs_p = os.path.join(root, f)
+                            zf.write(abs_p, os.path.relpath(abs_p, workdir))
+                            count += 1
+            # Send zip directly as download
+            with open(zip_path, "rb") as f:
+                data = f.read()
+            try:
+                self.send_response(200)
+                for k, v in CORS.items():
+                    self.send_header(k, v)
+                self.send_header("Content-Type",        "application/zip")
+                self.send_header("Content-Disposition", f'attachment; filename="{zip_name}"')
+                self.send_header("Content-Length",      str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionAbortedError):
+                pass
+            try:
+                os.unlink(zip_path)
+            except Exception:
+                pass
+        except Exception as e:
+            json_resp(self, 500, {"error": str(e)})
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tray", action="store_true")
+    args = parser.parse_args()
+
+    server = HTTPServer(("localhost", PROXY_PORT), Handler)
+    server.allow_reuse_address = True
+
+    print(f"""
   ███████╗██████╗  █████╗ ██╗   ██╗██████╗ ███████╗
   ██╔════╝██╔══██╗██╔══██╗██║   ██║██╔══██╗██╔════╝
   █████╗  ██████╔╝███████║██║   ██║██║  ██║█████╗
   ██╔══╝  ██╔══██╗██╔══██║██║   ██║██║  ██║██╔══╝
   ██║     ██║  ██║██║  ██║╚██████╔╝██████╔╝███████╗
   ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝
-  Proxy :11435  |  Ollama :11434  |  FraudeCode Web Bridge
-"""
+  Proxy :{PROXY_PORT}  |  Ollama :{OLLAMA_PORT}  |  FraudeCode Web Bridge
 
-def start_ollama():
-    try:
-        kw = {'creationflags': 0x08000000} if sys.platform=='win32' else {'start_new_session': True}
-        subprocess.Popen(['ollama','serve'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
-        for _ in range(20):
-            if ollama_running(): return True
-            time.sleep(1)
-        return False
-    except FileNotFoundError: return False
+  {"✓" if ollama_ok() else "✗"} Ollama :{OLLAMA_PORT}
+  ✓ Proxy :{PROXY_PORT}  (Ctrl+C to stop)
+""")
 
-def main():
-    if not USE_TRAY: print(BANNER)
-    if not ollama_running():
-        if not USE_TRAY: print('  Starting Ollama...', end='', flush=True)
-        ok = start_ollama()
-        if not USE_TRAY: print(' ✓' if ok else ' ✗ (install from ollama.com)')
-    elif not USE_TRAY:
-        print(f'  ✓ Ollama :{OLLAMA_PORT}')
-
-    server = HTTPServer(('localhost', PROXY_PORT), Handler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-
-    if not USE_TRAY:
-        print(f'  ✓ Proxy :11435  (Ctrl+C to stop)\n')
-
-    threading.Thread(
-        target=lambda: (time.sleep(1.5),
-            webbrowser.open(f'{FRAUDE_URL}?ollamaProxy=1&ollamaPort={PROXY_PORT}')),
-        daemon=True
-    ).start()
-
-    if USE_TRAY: run_tray(server)
-    else:
+    if args.tray:
         try:
-            while True: time.sleep(1)
-        except KeyboardInterrupt:
-            print('\n  Stopped.')
+            _run_tray(server)
+            return
+        except Exception:
+            pass  # tray failed, fall through to normal serve
 
-if __name__ == '__main__': main()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nProxy stopped.")
+
+def _run_tray(server):
+    import pystray
+    from PIL import Image, ImageDraw
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    # Create a simple icon
+    img = Image.new("RGB", (64, 64), "#e8572a")
+    d   = ImageDraw.Draw(img)
+    d.text((10, 16), "F", fill="white")
+    icon = pystray.Icon(
+        "fraude-proxy",
+        img,
+        "Fraude Proxy",
+        menu=pystray.Menu(
+            pystray.MenuItem("Fraude Proxy running", None, enabled=False),
+            pystray.MenuItem("Stop", lambda: icon.stop()),
+        ),
+    )
+    icon.run()
+    server.shutdown()
+
+if __name__ == "__main__":
+    main()

@@ -37,6 +37,7 @@ class Session:
             'id': self.id, 'name': self.name,
             'history': self.history,
             'repo_url': self.repo_url,
+            'agent_override': getattr(self, 'agent_override', ''),
             'updated': datetime.now().isoformat()
         }, indent=2, ensure_ascii=False), encoding='utf-8')
 
@@ -44,8 +45,9 @@ class Session:
     def load(p: Path) -> 'Session':
         d = json.loads(p.read_text('utf-8'))
         s = Session(d['id'], d.get('name'))
-        s.history  = d.get('history', [])
-        s.repo_url = d.get('repo_url', '')
+        s.history        = d.get('history', [])
+        s.repo_url       = d.get('repo_url', '')
+        s.agent_override = d.get('agent_override', '')
         s.workdir  = CODE_DIR / f'workspace_{s.id}'
         s.workdir.mkdir(parents=True, exist_ok=True)
         s.venv_dir = s.workdir / '.venv'
@@ -97,7 +99,7 @@ class Session:
         return r.returncode == 0
 
     def run_file(self, path: Path) -> subprocess.CompletedProcess:
-        """Run a file in this session's venv."""
+        """Run a file in this session's venv — interactive mode (no output capture)."""
         venv_py = self.ensure_venv(log=False)
         ext = path.suffix.lower()
         if ext == '.py':
@@ -108,7 +110,11 @@ class Session:
             cmd = ['node', str(path)]
         else:
             raise ValueError(f'Cannot run {ext} files automatically')
-        return subprocess.run(cmd, capture_output=True, text=True, cwd=self.workdir, timeout=60)
+        # Run interactively — stdout/stderr go directly to terminal, stdin from terminal
+        # This lets the user see prompts and type input in real time
+        r = subprocess.run(cmd, cwd=self.workdir, timeout=300)
+        # Return a minimal result object for compatibility
+        return type('Result', (), {'returncode': r.returncode, 'stdout': '', 'stderr': ''})()
 
     def clone_repo(self, url: str) -> bool:
         """Clone a git repo into a subdirectory of this session's workspace."""
